@@ -26,27 +26,33 @@ unsigned char CAN_read_buf[8];
 unsigned char CAN_send_buf[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 unsigned long CAN_Id = 0;
 boolean new_CAN_Message = false;
-unsigned long write_sensors_to_ECU_prev_time = 0;
+unsigned long write_TMAP_to_ECU_prev_time = 0;
+unsigned long write_UEGO_to_ECU_prev_time = 0;
 unsigned long time_since_engine_start = 0;
 unsigned long time_at_eng_count_increment = 0;
+unsigned long clusterPacketTime = 0;
 boolean engine_running = false;
 int oxygen_sens_start_delay = 200;
 
 void setup() {
   //delay while car voltage stabilizes...
-  //delay(5000);//5 seconds
+  Serial.begin(9600);
+  delay(2000);//2 seconds
 
   //start CAN shield - we'll get stuck here if we fail to initialize the CAN bus
 START_INIT_CAN:
   if ( CAN_OK != CAN.begin(CAN_1000KBPS) ) // init can bus : baudrate = 1000k = 1MBps
   {
+    Serial.println(F("Retry Starting CAN.."));
     delay(100);
     goto START_INIT_CAN;
   }
 
+/*
   //start the SD card too - this will also get us stuck if it fails
 START_INIT_SD:
   if ( !SD.begin(SPI_CS_PIN_SD) ) {
+    Serial.println(F("Retry Starting SD shield.."));
     delay(100);
     goto START_INIT_SD;
   }
@@ -57,6 +63,7 @@ START_INIT_SD:
     dataFile.println(F("Time [ms], Oil Temperature [deg C], CANID, CAN0, CAN1, CAN2, CAN3, CAN4, CAN5, CAN6, CAN7,"));
     dataFile.close();
   }
+  */
 
   //sweep the gauge cluster to indicate to the user that we've completed our initialization
   sweep_gauge_cluster();
@@ -68,12 +75,13 @@ START_INIT_SD:
 
   //initialize our timers
   log_prev_time = millis();
-  write_sensors_to_ECU_prev_time = log_prev_time;
+  write_TMAP_to_ECU_prev_time = log_prev_time;
+  write_UEGO_to_ECU_prev_time = log_prev_time;
   time_at_eng_count_increment = log_prev_time;
 }
 
 void loop() {
-
+  
   //did we receive a CAN message? If so, read it in and set a flag
   while(CAN_MSGAVAIL == CAN.checkReceive())
   {
@@ -84,6 +92,7 @@ void loop() {
     //interpret gauge cluster data so we can tell if the engine is running
     if (CAN_Id == 0x400)
     {
+      clusterPacketTime = millis();
       uint16_t engine_speed = (CAN_read_buf[2] << 8) + CAN_read_buf[3];
       if (engine_speed > 500 && !engine_running)
       {
@@ -97,21 +106,27 @@ void loop() {
         time_since_engine_start = 0;
       }
     }
+    else{
+      //printCANpacket(CAN_Id, CAN_read_buf, CAN_len);
+    }
+    //printCANpacket(CAN_Id, CAN_read_buf, CAN_len);
   }
 
-  //log the gauge cluster message (ID = 0x400) at 1Hz, and any other message immediately
   unsigned long currentTime = millis();
+  //read in the oil pan temperature
+  double oil_temperature = tempRead(thermometerPin);
+  
+  //log the gauge cluster message (ID = 0x400) at 1Hz, and any other message immediately  
+  /*
   if (currentTime - log_prev_time > 1000 || (CAN_Id != 0x400 && new_CAN_Message == true))
   {
-    //read in the oil pan temperature
-    double temperature = tempRead(thermometerPin);
 
     dataFile = SD.open("datalog.txt", FILE_WRITE);
     //then write to the SD card, if the file is available
     if (dataFile) {
       dataFile.print(currentTime);
       dataFile.print(F(","));
-      dataFile.print(temperature);
+      dataFile.print(oil_temperature);
       dataFile.print(F(","));
       dataFile.print(CAN_Id, HEX);
       dataFile.print(F(","));
@@ -128,41 +143,63 @@ void loop() {
     log_prev_time = currentTime;
 
   }
+  */
 
   //read in the other analog outputs from other sensors, and send
   //the values to the Lotus ECU at 10Hz
   //send 0x6 bytes to ID 0x55, first 4 are address, next 2 are data to write there
   //do this once for each 10-bit analog read value
-  if (currentTime - write_sensors_to_ECU_prev_time >= 100)
+  if (currentTime - write_TMAP_to_ECU_prev_time >= 100 && currentTime - clusterPacketTime <= 50) //don't send messages that may overlap with the cluster CAN packet
   {
     uint16_t TMAP_P_AtoD = analogRead(TMAP_MAP_pin);
     uint16_t TMAP_T_AtoD = analogRead(TMAP_IAT_pin);
-    uint16_t O2_AtoD = analogRead(O2_linear_pin);
+
+    //send to 0x54 for 32-bit, 0x55 for 16-bit, and 0x56 for 8-bit data transfer 
+    CAN_send_buf[0] = 0x00;
     CAN_send_buf[1] = 0x08;//0x82000 is unused RAM
     CAN_send_buf[2] = 0x20;
     CAN_send_buf[3] = 0x00;
-    CAN_send_buf[4] = ((TMAP_P_AtoD >> 0x8) && 0xFF);
-    CAN_send_buf[5] = (TMAP_P_AtoD && 0xFF);
-    CAN.sendMsgBuf(0x55, 0, 6, CAN_send_buf);
+    CAN_send_buf[4] = ((TMAP_P_AtoD >> 0x8) & 0xFF);
+    CAN_send_buf[5] = (TMAP_P_AtoD & 0xFF);
+    CAN_send_buf[6] = ((TMAP_T_AtoD >> 0x8) & 0xFF);//0x82002
+    CAN_send_buf[7] = (TMAP_T_AtoD & 0xFF);
+    CAN.sendMsgBuf(0x54, 0, 8, CAN_send_buf);
+    //I need to figure out if this creates a response CAN message from the ECU.. I may need to read that in.
+    //I checked this, and see no response from the ECU (only the gauge cluster packets being sent)
+    /*
+    Serial.print(currentTime);
+    Serial.print(F(",P:"));
+    Serial.print(TMAP_P_AtoD);
+    Serial.print(F(","));
+    Serial.print(CAN_send_buf[4]);
+    Serial.print(F(","));
+    Serial.println(CAN_send_buf[5]);
+    */
 
-    CAN_send_buf[3] = 0x02;//0x82002
-    CAN_send_buf[4] = ((TMAP_T_AtoD >> 0x8) && 0xFF);
-    CAN_send_buf[5] = (TMAP_T_AtoD && 0xFF);
-    CAN.sendMsgBuf(0x55, 0, 6, CAN_send_buf);
+    write_TMAP_to_ECU_prev_time = millis();
+  }
 
+  if (currentTime - write_UEGO_to_ECU_prev_time >= 100 && currentTime - clusterPacketTime <= 50 && (currentTime - write_TMAP_to_ECU_prev_time <= 80 && currentTime - write_TMAP_to_ECU_prev_time >= 10) ) //don't send messages that may overlap with the other CAN packets
+  {
+    uint16_t O2_AtoD = analogRead(O2_linear_pin);
+    CAN_send_buf[0] = 0x00;
+    CAN_send_buf[1] = 0x08;
+    CAN_send_buf[2] = 0x20;
     CAN_send_buf[3] = 0x04;//0x82004
-    CAN_send_buf[4] = ((O2_AtoD >> 0x8) && 0xFF);
-    CAN_send_buf[5] = (O2_AtoD && 0xFF);
-    CAN.sendMsgBuf(0x55, 0, 6, CAN_send_buf);
-
-    write_sensors_to_ECU_prev_time = currentTime;
+    CAN_send_buf[4] = ((O2_AtoD >> 0x8) & 0xFF);
+    CAN_send_buf[5] = (O2_AtoD & 0xFF);
+    CAN_send_buf[6] = (int)oil_temperature + 40;//0x82006
+    CAN_send_buf[7] = 0x00;
+    CAN.sendMsgBuf(0x54, 0, 8, CAN_send_buf);
+    
+    write_UEGO_to_ECU_prev_time = millis();
   }
 
   //also, we should manage the power given to the O2 sensor - if we power
   //it on too early then we risk cracking the element
   if (engine_running && currentTime - time_at_eng_count_increment >= 1000) {
     time_since_engine_start += 1;
-    time_at_eng_count_increment = currentTime;
+    time_at_eng_count_increment = millis();
   }
 
   if (time_since_engine_start >= oxygen_sens_start_delay)
@@ -252,8 +289,8 @@ void sweep_gauge_cluster() {
     tacho = i*tachoStep;
     CAN_send_buf[0] = speedo;
     CAN_send_buf[1] = 0x00;
-    CAN_send_buf[2] = (tacho && 0xFF);
-    CAN_send_buf[3] = (tacho >> 8) && 0xFF;
+    CAN_send_buf[2] = (tacho >> 8) & 0xFF;
+    CAN_send_buf[3] = (tacho & 0xFF);
     CAN_send_buf[4] = 0x80;//50% fuel level
     CAN_send_buf[5] = 0x00;
     CAN_send_buf[6] = 0x00;
@@ -272,4 +309,15 @@ void sweep_gauge_cluster() {
   CAN_send_buf[5] = 0x00;
   CAN_send_buf[6] = 0x00;
   CAN_send_buf[7] = 0x00;
+}
+
+void printCANpacket(unsigned long ID, unsigned char bufferData[], unsigned char bufferLen) {
+  Serial.print(F("ID: "));
+  Serial.print(ID,HEX);
+  Serial.print(F(" [ "));
+  for(uint8_t i = 0; i < bufferLen; i++){
+    Serial.print(bufferData[i],HEX);
+    Serial.print(F(" "));
+  }
+  Serial.println(F("]"));
 }
